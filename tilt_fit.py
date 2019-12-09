@@ -8,6 +8,7 @@ parser.add_argument("--vmin", default=None, type=float)
 args = parser.parse_args()
 
 import numpy as np
+import h5py
 from IPython import embed
 from dxtbx.model.experiment_list import ExperimentListFactory
 import pylab as plt
@@ -28,180 +29,177 @@ def is_outlier(points, thresh=3.5):
     return modified_z_score > thresh
 
 
-expand_fact = 7
-GAIN = 28
-sigma_readout = 3
-spot_thresh = 1e-2
-outlier_Z = np.inf
-data = np.load("tilt.dat.npz")
-bboxes = data["bboxes"][()]
-panel_ids = data["bbox_panel_ids"][()]
-is_bg_pix = data["is_bg_pixel"][()]  # boolean tells if pixel is bg
-imgs = data["imgs"][()]
+def tilt_fit(bbox_expanse, photon_gain, sigma_rdout, zinger_zscore,
+             exper, predicted_refls, minsnr=None, plot=False, **kwargs):
+    det = exper.detector
+    ss_dim, fs_dim = imgs[0].shape
+    n_refl = len(predicted_refls)
+    integrations = []
+    variances = []
+    coeffs = []
+    for i_ref, ref in enumerate(predicted_refls):
+        i1_, i2_, j1_, j2_, _, _ = ref['bbox']  # bbox of prediction
+        # expand bbox a bit to include more bg pix
+        # trim bbox if its along edge of detector
+        i1 = max(i1_ - bbox_expanse, 0)
+        i2 = min(i2_ + bbox_expanse, fs_dim)
+        j1 = max(j1_ - bbox_expanse, 0)
+        j2 = min(j2_ + bbox_expanse, ss_dim)
 
-El = ExperimentListFactory.from_json_file('idx-dalinar_rank0_data0_fluence0.h5_refined.expt', check_format=False)
-crystal = El[0].crystal
-DET = El[0].detector
-BEAM = El[0].beam
-refls = flex.reflection_table.from_file("R")
+        # which detector panel am I on ?
+        i_panel = ref['panel']
 
-#FF = [1e3]
-#energies = [9033.898352052613]
-#FLUX = [80191763520.0]
-#Ncells_abc = 5, 5, 5  # make it quick
-#spot_thresh = 1e-2
-#
-####
-#
-#simsAB = sim_utils.sim_colors(
-#    crystal, DET, BEAM, FF, energies,
-#    FLUX, pids=None, profile="gauss", cuda=False, oversample=1,
-#    Ncells_abc=Ncells_abc, mos_dom=1, mos_spread=0,
-#    show_params=False, accumulate=False)
-#
-#R = prediction_utils.refls_from_sims(simsAB[0], DET, BEAM, thresh=spot_thresh)
+        # get the iamge and mask
+        shoebox_img = imgs[i_panel][j1:j2, i1:i2] / photon_gain  # NOTE: gain is imortant here!
+        shoebox_mask = is_bg_pix[i_panel, j1:j2, i1:i2]
 
-ss_dim, fs_dim = imgs[0].shape
-n_refl = len(refls)
-integrations = []
-variances = []
-for i_ref,ref in enumerate(refls):
-    i1_, i2_, j1_, j2_, _, _ = ref['bbox']  # bbox of prediction
-    # expand bbox a bit to include more bg pix
-    # trim bbox if its along edge of detector
-    i1 = max(i1_ - expand_fact, 0)
-    i2 = min(i2_ + expand_fact, fs_dim)
-    j1 = max(j1_ - expand_fact, 0)
-    j2 = min(j2_ + expand_fact, ss_dim)
+        # get coordinates arrays of the image
+        Y, X = np.indices(shoebox_img.shape)
 
-    # which detector panel am I on ?
-    i_panel = ref['panel']
+        # determine if any more outliers are present in background pixels
+        img1d = shoebox_img.ravel()
+        mask1d = shoebox_mask.ravel()  # mask specifies which pixels are bg
+        # out1d specifies which bg pixels are outliers (zingers)
+        out1d = np.zeros(mask1d.shape, bool)
+        out1d[mask1d] = is_outlier(img1d[mask1d].ravel(), zinger_zscore)
+        out2d = out1d.reshape(shoebox_img.shape)
 
-    # get the iamge and mask
-    shoebox_img = imgs[i_panel][j1:j2, i1:i2] / GAIN  # NOTE: gain is imortant here!
-    shoebox_mask = is_bg_pix[i_panel, j1:j2, i1:i2]
+        # these are points we fit to: both zingers and original mask
+        fit_sel = np.logical_and(~out2d, shoebox_mask)  # fit plane to these points, no outliers, no masked
 
-    # get coordinates arrays of the image
-    Y, X = np.indices(shoebox_img.shape)
-    Y1d, X1d = Y.ravel(), X.ravel()
+        # fast scan pixels, slow scan pixels, pixel values (corrected for gain)
+        fast, slow, rho_bg = X[fit_sel], Y[fit_sel], shoebox_img[fit_sel]
 
-    # determine if any more outliers are present in background pixels
-    img1d = shoebox_img.ravel()
-    mask1d = shoebox_mask.ravel()  # mask specifies which pixels are bg
-    # out1d specifies which bg pixels are outliers (zingers)
-    out1d = np.zeros(mask1d.shape, bool)
-    out1d[mask1d] = is_outlier(img1d[mask1d].ravel(), outlier_Z)
-    out2d = out1d.reshape(shoebox_img.shape)
+        # do the fit of the background plane
+        A = np.array([fast, slow, np.ones_like(fast)]).T
 
-    # these are points we fit to: both zingers and original mask
-    fit_sel = np.logical_and(~out2d, shoebox_mask)  # fit plane to these points, no outliers, no masked
+        # weights matrix:
+        W = np.diag(1 / (sigma_rdout ** 2 + rho_bg))
+        AWA = np.dot(A.T, np.dot(W, A))
+        AWA_inv = np.linalg.inv(AWA)
+        AtW = np.dot(A.T, W)
+        a, b, c = np.dot(np.dot(AWA_inv, AtW), rho_bg)
+        coeffs.append( (a, b, c))
 
-    # fast scan pixels, slow scan pixels, pixel values (corrected for gain)
-    fast, slow, rho_bg = X[fit_sel], Y[fit_sel], shoebox_img[fit_sel]
+        # fit of the tilt plane background
+        #tilt = (X1d * a + Y1d * b + c).reshape(shoebox_img.shape)
 
-    # do the fit of the background plane
-    A = np.array([fast, slow, np.ones_like(fast)]).T
+        # vector of residuals
+        r = rho_bg - np.dot(A, (a, b, c))
+        Nbg = len(rho_bg)
+        Nparam = 3
+        r_fact = np.dot(r.T, np.dot(W, r)) / (Nbg - Nparam)
+        var_covar = AWA_inv * r_fact
+        abc_var = var_covar[0][0], var_covar[1][1], var_covar[2][2]
 
-    # weights matrix:
-    W = np.diag(1 / (sigma_readout ** 2 + rho_bg))
-    AWA = np.dot(A.T, np.dot(W, A))
-    AWA_inv = np.linalg.inv(AWA)
-    AtW = np.dot(A.T, W)
-    a, b, c = np.dot(np.dot(AWA_inv, AtW), rho_bg)
-    tilt = (X1d * a + Y1d * b + c).reshape(shoebox_img.shape)
+        # place the strong spot mask in the expanded shoebox
+        peak_mask = ref['shoebox'].mask.as_numpy_array()[0] == 5
+        peak_mask_expanded = np.zeros_like(shoebox_mask)
+        Nj, Ni = j2_ - j1_, i2_ - i1_
+        jstart = j1_ - j1
+        istart = i1_ - i1
+        peak_mask_expanded[jstart:jstart+Nj, istart: istart+Ni] = peak_mask
 
-    # vector of residuals
-    r = rho_bg - np.dot(A, (a, b, c))
-    Nbg = len(rho_bg)
-    Nparam = 3
-    r_fact = np.dot(r.T, np.dot(W, r)) / (Nbg - Nparam)
-    var_covar = AWA_inv * r_fact
-    abc_var = var_covar[0][0], var_covar[1][1], var_covar[2][2]
+        p = X[peak_mask_expanded]  # fast scan coords
+        q = Y[peak_mask_expanded]  # slow scan coords
+        rho_peak = shoebox_img[peak_mask_expanded]  # pixel values
 
-    peak_mask = ref['shoebox'].mask.as_numpy_array()[0] == 5
-    peak_mask_expanded = np.zeros_like(shoebox_mask)
-    Nj, Ni = j2_ - j1_, i2_ - i1_
-    jstart = j1_ - j1
-    istart = i1_ - i1
-    peak_mask_expanded[jstart:jstart+Nj, istart: istart+Ni] = peak_mask
+        Isum = np.sum(rho_peak - a*p - b*q - c)  # summed spot intensity
 
-    p = X[peak_mask_expanded]
-    q = Y[peak_mask_expanded]
-    rho_peak = shoebox_img[peak_mask_expanded]
+        var_rho_peak = sigma_rdout ** 2 + rho_peak  # include readout noise in the variance
+        Ns = len(rho_peak)  # number of integrated peak pixels
 
-    Isum = np.sum(rho_peak - a*p - b*q - c)
+        # variance propagated from tilt plane constants
+        var_a_term = abc_var[0] * ((np.sum(p))**2)
+        var_b_term = abc_var[1] * ((np.sum(q))**2)
+        var_c_term = abc_var[2] * (Ns**2)
+        # total variance of the spot
+        var_Isum = np.sum(var_rho_peak) + var_a_term + var_b_term + var_c_term
 
-    var_rho_peak = sigma_readout**2 + rho_peak
-    Ns = len(rho_peak)  # number of integrated peak pixels
+        integrations.append(Isum)
+        variances.append(var_Isum)
 
-    var_a_term = abc_var[0] * ((np.sum(p))**2)
-    var_b_term = abc_var[1] * ((np.sum(q))**2)
-    var_c_term = abc_var[2] * (Ns**2)
-    var_Isum = np.sum(var_rho_peak) + var_a_term + var_b_term + var_c_term
+        if i_ref % 50 == 0:
+            print("Integrated refls %d / %d" % (i_ref+1, n_refl))
 
-    integrations.append(Isum)
-    variances.append(var_Isum)
+    integrations = np.array(integrations)
+    variances = np.array(variances)
 
-    #SNR = var_Isum / np.sqrt(var_Isum)
-    if i_ref % 20 == 0:
-        print("Integrated refls %d / %d" % (i_ref+1, n_refl))
+    if plot:
+        assert args.minsnr is not None
+        all_xx = []
+        all_yy = []
+        for i_panel in range(len(imgs)):
+            node = det[i_panel]
+            pix = node.get_pixel_size()[0]
+            fs = np.array(node.get_fast_axis())
+            ss = np.array(node.get_slow_axis())
+            o = np.array(node.get_origin()) / pix
 
+            Nfs, Nss = node.get_image_size()
+            Y, X = np.indices((Nss, Nfs))
+            xx = fs[0] * X + ss[0] * Y + o[0]
+            yy = fs[1] * X + ss[1] * Y + o[1]
+            all_xx.append(xx)
+            all_yy.append(yy)
+        all_xx = np.array(all_xx)
+        all_yy = np.array(all_yy)
 
-all_xx = []
-all_yy = []
-for i_panel in range(64):
-    node = DET[i_panel]
-    pix = node.get_pixel_size()[0]
-    fs = np.array(node.get_fast_axis())
-    ss = np.array(node.get_slow_axis())
-    o = np.array(node.get_origin()) / pix
-
-    Nfs, Nss = node.get_image_size()
-    Y, X = np.indices((Nss, Nfs))
-    xx = fs[0] * X + ss[0] * Y + o[0]
-    yy = fs[1] * X + ss[1] * Y + o[1]
-    all_xx.append(xx)
-    all_yy.append(yy)
-all_xx = np.array(all_xx)
-all_yy = np.array(all_yy)
-
-binsX = np.arange(int(np.min(all_xx)), int(np.max(all_xx)), 1)
-binsY = np.arange(int(np.min(all_yy)), int(np.max(all_yy)), 1)
-out = np.histogram2d(all_xx.ravel(), all_yy.ravel(), bins=(binsX, binsY), weights=imgs.ravel())
+        binsX = np.arange(int(np.min(all_xx)), int(np.max(all_xx)), 1)
+        binsY = np.arange(int(np.min(all_yy)), int(np.max(all_yy)), 1)
+        out = np.histogram2d(all_xx.ravel(), all_yy.ravel(), bins=(binsX, binsY), weights=imgs.ravel())
 
 
-r_snr = args.minsnr
-r_sz = 5
-r_color = 'Limegreen'
+        r_sz = 5
+        r_color = 'Limegreen'
 
-rej_sz = 5
-rej_color = 'Darkorange'
-rej_patches = []
-r_patches = []
-snr = np.array(integrations) / np.sqrt(variances)
-for i_r in range(len(refls)):
-    ref = refls[i_r]
-    node = DET[ref['panel']]
-    pixsize = node.get_pixel_size()[0]
-    xpix, ypix, _ = ref['xyzobs.px.value']
+        rej_sz = 5
+        rej_color = 'Darkorange'
+        rej_patches = []
+        r_patches = []
+        snr = integrations / np.sqrt(variances)
+        for i_r in range(len(predicted_refls)):
+            ref = predicted_refls[i_r]
+            node = det[ref['panel']]
+            pixsize = node.get_pixel_size()[0]
+            xpix, ypix, _ = ref['xyzobs.px.value']
 
-    xlab, ylab, _ = np.array(node.get_pixel_lab_coord((xpix, ypix)))/pixsize
+            xlab, ylab, _ = np.array(node.get_pixel_lab_coord((xpix, ypix)))/pixsize
 
-    if snr[i_r] >= r_snr:
-        r_rect = plt.Rectangle(xy=(ylab - r_sz, xlab - r_sz), width=2 * r_sz,
-                               height=2 * r_sz, ec=r_color, fc='None')
-        r_patches.append(r_rect)
+            if snr[i_r] >= minsnr:
+                r_rect = plt.Rectangle(xy=(ylab - r_sz, xlab - r_sz), width=2 * r_sz,
+                                       height=2 * r_sz, ec=r_color, fc='None')
+                r_patches.append(r_rect)
 
-    else:
-        rect = plt.Rectangle(xy=(ylab-rej_sz, xlab-rej_sz), width=2*rej_sz,
-                         height=2*rej_sz, ec=rej_color, fc='None')
-        rej_patches.append(rect)
+            else:
+                rect = plt.Rectangle(xy=(ylab-rej_sz, xlab-rej_sz), width=2*rej_sz,
+                                 height=2*rej_sz, ec=rej_color, fc='None')
+                rej_patches.append(rect)
 
-plt.clf()
-plt.imshow(out[0], vmax=args.vmax, vmin=args.vmin,
-        extent=(out[2][0], out[2][-1], out[1][-1], out[1][0]))
-coll = plt.mpl.collections.PatchCollection(rej_patches, match_original=True)
-r_coll = plt.mpl.collections.PatchCollection(r_patches, match_original=True)
-plt.gca().add_collection(coll)
-plt.gca().add_collection(r_coll)
-plt.show()
+        plt.clf()
+        plt.imshow(out[0], extent=(out[2][0], out[2][-1], out[1][-1], out[1][0]), **kwargs)
+        coll = plt.mpl.collections.PatchCollection(rej_patches, match_original=True)
+        r_coll = plt.mpl.collections.PatchCollection(r_patches, match_original=True)
+        plt.gca().add_collection(coll)
+        plt.gca().add_collection(r_coll)
+        plt.suptitle("Green: SNR >= %.2f, Orange:SNR < %.2f" % (minsnr, minsnr))
+        plt.show()
+
+    return coeffs, integrations, variances
+
+
+if __name__ == "__main__":
+    expand_fact = 7
+    GAIN = 28
+    sigma_readout = 3
+    outlier_Z = np.inf
+    data = h5py.File("img_and_spotmask.h5py", "r")
+    is_bg_pix = data["is_background_pixel"][()]  # boolean tells if pixel is bg
+    imgs = data["panel_imgs"][()]
+    El = ExperimentListFactory.from_json_file('idx-dalinar_rank0_data0_fluence0.h5_refined.expt', check_format=False)
+    refls = flex.reflection_table.from_file("R")
+    experiment = El[0]
+    tilt_fit(
+        expand_fact, GAIN, sigma_readout, outlier_Z,
+        experiment, refls, minsnr=args.minsnr, plot=True,
+        vmin=args.vmin, vmax=args.vmax)
