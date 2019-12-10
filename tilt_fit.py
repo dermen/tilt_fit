@@ -9,10 +9,15 @@ args = parser.parse_args()
 
 import numpy as np
 import h5py
-from IPython import embed
-from dxtbx.model.experiment_list import ExperimentListFactory
 import pylab as plt
+from IPython import embed
+
+from scitbx.matrix import sqr
+from dxtbx.model.experiment_list import ExperimentList, ExperimentListFactory
 from dials.array_family import flex
+from dials.algorithms.shoebox import MaskCode
+from dials.model.data import Shoebox
+from dials.algorithms.indexing import assign_indices
 
 
 def is_outlier(points, thresh=3.5):
@@ -29,14 +34,84 @@ def is_outlier(points, thresh=3.5):
     return modified_z_score > thresh
 
 
+def refls_to_q(refls, detector, beam, update_table=False):
+
+    orig_vecs = {}
+    fs_vecs = {}
+    ss_vecs = {}
+    u_pids = set([r['panel'] for r in refls])
+    for pid in u_pids:
+        orig_vecs[pid] = np.array(detector[pid].get_origin())
+        fs_vecs[pid] = np.array(detector[pid].get_fast_axis())
+        ss_vecs[pid] = np.array(detector[pid].get_slow_axis())
+
+    s1_vecs = []
+    q_vecs = []
+    for r in refls:
+        pid = r['panel']
+        i_fs, i_ss, _ = r['xyzobs.px.value']
+        panel = detector[pid]
+        orig = orig_vecs[pid]
+        fs = fs_vecs[pid]
+        ss = ss_vecs[pid]
+
+        fs_pixsize, ss_pixsize = panel.get_pixel_size()
+        s1 = orig + i_fs*fs*fs_pixsize + i_ss*ss*ss_pixsize  # scattering vector
+        s1 = s1 / np.linalg.norm(s1) / beam.get_wavelength()
+        s1_vecs.append(s1)
+        q_vecs.append(s1-beam.get_s0())
+
+    if update_table:
+        refls['s1'] = flex.vec3_double(tuple(map(tuple,s1_vecs)))
+        refls['rlp'] = flex.vec3_double(tuple(map(tuple,q_vecs)))
+
+    return np.vstack(q_vecs)
+
+
+def refls_to_hkl(refls, detector, beam, crystal,
+                 update_table=False, returnQ=False):
+    """
+    convert pixel panel reflections to miller index data
+
+    :param refls:  reflecton table for a panel or a tuple of (x,y)
+    :param detector:  dxtbx detector model
+    :param beam:  dxtbx beam model
+    :param crystal: dxtbx crystal model
+    :param update_table: whether to update the refltable
+    :param returnQ: whether to return intermediately computed q vectors
+    :return: if as_numpy two Nx3 numpy arrays are returned
+        (one for fractional and one for whole HKL)
+        else dictionary of hkl_i (nearest) and hkl (fractional)
+    """
+    q_vecs = refls_to_q(refls, detector, beam, update_table=update_table)
+    Ai = sqr(crystal.get_A()).inverse()
+    Ai = Ai.as_numpy_array()
+    HKL = np.dot(Ai, q_vecs.T)
+    HKLi = map(lambda h: np.ceil(h-0.5).astype(int), HKL)
+    if update_table:
+        refls['miller_index'] = flex.miller_index(len(refls),(0,0,0))
+        mil_idx = flex.vec3_int(tuple(map(tuple, np.vstack(HKLi).T)))
+        for i in range(len(refls)):
+            refls['miller_index'][i] = mil_idx[i]
+    if returnQ:
+        return np.vstack(HKL).T, np.vstack(HKLi).T, q_vecs
+    else:
+        return np.vstack(HKL).T, np.vstack(HKLi).T
+
+
 def tilt_fit(bbox_expanse, photon_gain, sigma_rdout, zinger_zscore,
              exper, predicted_refls, minsnr=None, plot=False, **kwargs):
-    det = exper.detector
+
+    refls.centroid_px_to_mm(exper.detector)
+    refls.map_centroids_to_reciprocal_space(exper.detector, exper.beam)
+    refls['id'] = flex.int(len(refls), -1)
+    refls['imageset_id'] = flex.int(len(refls), 0)
     ss_dim, fs_dim = imgs[0].shape
     n_refl = len(predicted_refls)
     integrations = []
     variances = []
     coeffs = []
+    new_shoeboxes = []
     for i_ref, ref in enumerate(predicted_refls):
         i1_, i2_, j1_, j2_, _, _ = ref['bbox']  # bbox of prediction
         # expand bbox a bit to include more bg pix
@@ -49,9 +124,20 @@ def tilt_fit(bbox_expanse, photon_gain, sigma_rdout, zinger_zscore,
         # which detector panel am I on ?
         i_panel = ref['panel']
 
+
         # get the iamge and mask
         shoebox_img = imgs[i_panel][j1:j2, i1:i2] / photon_gain  # NOTE: gain is imortant here!
+        dials_mask = np.zeros(shoebox_img.shape).astype(np.int32)
+
+        # initially all pixels are valie
+        dials_mask += MaskCode.Valid
         shoebox_mask = is_bg_pix[i_panel, j1:j2, i1:i2]
+
+        dials_mask[shoebox_mask] = dials_mask[shoebox_mask] + MaskCode.Background
+
+        new_shoebox = Shoebox((i1, i2, j1, j2, 0, 1))
+        new_shoebox.allocate()
+        new_shoebox.data = flex.float(shoebox_img[None,])
 
         # get coordinates arrays of the image
         Y, X = np.indices(shoebox_img.shape)
@@ -66,6 +152,8 @@ def tilt_fit(bbox_expanse, photon_gain, sigma_rdout, zinger_zscore,
 
         # these are points we fit to: both zingers and original mask
         fit_sel = np.logical_and(~out2d, shoebox_mask)  # fit plane to these points, no outliers, no masked
+        # update the dials mask...
+        dials_mask[fit_sel] = dials_mask[fit_sel] + MaskCode.BackgroundUsed
 
         # fast scan pixels, slow scan pixels, pixel values (corrected for gain)
         fast, slow, rho_bg = X[fit_sel], Y[fit_sel], shoebox_img[fit_sel]
@@ -79,10 +167,13 @@ def tilt_fit(bbox_expanse, photon_gain, sigma_rdout, zinger_zscore,
         AWA_inv = np.linalg.inv(AWA)
         AtW = np.dot(A.T, W)
         a, b, c = np.dot(np.dot(AWA_inv, AtW), rho_bg)
-        coeffs.append( (a, b, c))
+        coeffs.append((a, b, c))
 
         # fit of the tilt plane background
-        #tilt = (X1d * a + Y1d * b + c).reshape(shoebox_img.shape)
+        X1d = np.ravel(X)
+        Y1d = np.ravel(Y)
+        background = (X1d * a + Y1d * b + c).reshape(shoebox_img.shape)
+        new_shoebox.background = flex.float(background[None, ])
 
         # vector of residuals
         r = rho_bg - np.dot(A, (a, b, c))
@@ -99,6 +190,9 @@ def tilt_fit(bbox_expanse, photon_gain, sigma_rdout, zinger_zscore,
         jstart = j1_ - j1
         istart = i1_ - i1
         peak_mask_expanded[jstart:jstart+Nj, istart: istart+Ni] = peak_mask
+
+        # update the dials mask
+        dials_mask[peak_mask_expanded] = dials_mask[peak_mask_expanded] + MaskCode.Foreground
 
         p = X[peak_mask_expanded]  # fast scan coords
         q = Y[peak_mask_expanded]  # slow scan coords
@@ -118,19 +212,32 @@ def tilt_fit(bbox_expanse, photon_gain, sigma_rdout, zinger_zscore,
 
         integrations.append(Isum)
         variances.append(var_Isum)
+        new_shoebox.mask = flex.int(dials_mask[None,])
+        new_shoeboxes.append(new_shoebox)
 
         if i_ref % 50 == 0:
             print("Integrated refls %d / %d" % (i_ref+1, n_refl))
 
     integrations = np.array(integrations)
     variances = np.array(variances)
+    refls["intensity.sum.value.Leslie99"] = flex.double(integrations)
+    refls["intensity.sum.variance.Leslie99"] = flex.double(variances)
+    refls['shoebox'] = flex.shoebox(new_shoeboxes)
+
+    # assign miller indices to the spots
+    #_=refls_to_hkl(refls, detector=exper.detector, beam=exper.beam,
+    #             crystal=exper.crystal, update_table=True)
+    El = ExperimentList()
+    El.append(exper)
+    idx_assign = assign_indices.AssignIndicesGlobal(tolerance=0.333)
+    idx_assign(refls, El)
 
     if plot:
         assert args.minsnr is not None
         all_xx = []
         all_yy = []
         for i_panel in range(len(imgs)):
-            node = det[i_panel]
+            node = exper.detector[i_panel]
             pix = node.get_pixel_size()[0]
             fs = np.array(node.get_fast_axis())
             ss = np.array(node.get_slow_axis())
@@ -160,7 +267,7 @@ def tilt_fit(bbox_expanse, photon_gain, sigma_rdout, zinger_zscore,
         snr = integrations / np.sqrt(variances)
         for i_r in range(len(predicted_refls)):
             ref = predicted_refls[i_r]
-            node = det[ref['panel']]
+            node = exper.detector[ref['panel']]
             pixsize = node.get_pixel_size()[0]
             xpix, ypix, _ = ref['xyzobs.px.value']
 
@@ -185,7 +292,7 @@ def tilt_fit(bbox_expanse, photon_gain, sigma_rdout, zinger_zscore,
         plt.suptitle("Green: SNR >= %.2f, Orange:SNR < %.2f" % (minsnr, minsnr))
         plt.show()
 
-    return coeffs, integrations, variances
+    return refls, coeffs, integrations, variances
 
 
 if __name__ == "__main__":
@@ -198,6 +305,10 @@ if __name__ == "__main__":
     imgs = data["panel_imgs"][()]
     El = ExperimentListFactory.from_json_file('idx-dalinar_rank0_data0_fluence0.h5_refined.expt', check_format=False)
     refls = flex.reflection_table.from_file("R")
+    # first step is to enlarge the shoebox region
+
+    #for r in refls:
+    #    sb.deallocate()
     experiment = El[0]
     tilt_fit(
         expand_fact, GAIN, sigma_readout, outlier_Z,
