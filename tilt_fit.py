@@ -99,31 +99,53 @@ def refls_to_hkl(refls, detector, beam, crystal,
         return np.vstack(HKL).T, np.vstack(HKLi).T
 
 
-def tilt_fit(bbox_expanse, photon_gain, sigma_rdout, zinger_zscore,
+def tilt_fit(imgs, is_bg_pix, delta_q, photon_gain, sigma_rdout, zinger_zscore,
              exper, predicted_refls, minsnr=None, plot=False, **kwargs):
 
-    refls.centroid_px_to_mm(exper.detector)
-    refls.map_centroids_to_reciprocal_space(exper.detector, exper.beam)
-    refls['id'] = flex.int(len(refls), -1)
-    refls['imageset_id'] = flex.int(len(refls), 0)
+    predicted_refls.centroid_px_to_mm(exper.detector)
+    predicted_refls.map_centroids_to_reciprocal_space(exper.detector, exper.beam)
+    predicted_refls['id'] = flex.int(len(refls), -1)
+    predicted_refls['imageset_id'] = flex.int(len(refls), 0)
     ss_dim, fs_dim = imgs[0].shape
     n_refl = len(predicted_refls)
     integrations = []
     variances = []
     coeffs = []
     new_shoeboxes = []
+    detdist = exper.detector[0].get_distance()
+    pixsize = exper.detector[0].get_pixel_size()[0]
+    ave_wave = exper.beam.get_wavelength()
     for i_ref, ref in enumerate(predicted_refls):
         i1_, i2_, j1_, j2_, _, _ = ref['bbox']  # bbox of prediction
-        # expand bbox a bit to include more bg pix
-        # trim bbox if its along edge of detector
-        i1 = max(i1_ - bbox_expanse, 0)
-        i2 = min(i2_ + bbox_expanse, fs_dim)
-        j1 = max(j1_ - bbox_expanse, 0)
-        j2 = min(j2_ + bbox_expanse, ss_dim)
 
         # which detector panel am I on ?
         i_panel = ref['panel']
 
+        # get the number of pixels spanning the box in pixels
+        Qmag = 2*np.pi*np.linalg.norm(ref['rlp'])  # magnitude momentum transfer of the RLP in physicist convention
+        rad1 = (detdist/pixsize) * np.tan(2*np.arcsin((Qmag-delta_q*.5)*ave_wave/4/np.pi))
+        rad2 = (detdist/pixsize) * np.tan(2*np.arcsin((Qmag+delta_q*.5)*ave_wave/4/np.pi))
+        bbox_extent = (rad2-rad1) / np.sqrt(2)   # rad2 - rad1 is the diagonal across the bbox
+        i_com, j_com, _ = ref['xyzobs.px.value']
+        #i_com = (i1_ + i2_)*.5
+        #j_com = (j1_ + j2_)*.5
+        i_low = int(i_com - bbox_extent/2.)
+        i_high = int(i_com + bbox_extent/2.)
+        j_low = int(j_com - bbox_extent/2.)
+        j_high = int(j_com + bbox_extent/2.)
+        # expand bbox a bit to include more bg pix
+        # trim bbox if its along edge of detector
+        i1 = max(i_low, 0)
+        i2 = min(i_high, fs_dim)
+        j1 = max(j_low, 0)
+        j2 = min(j_high, ss_dim)
+
+        if i1 == 0 or i2 == fs_dim or j1 == 0 or j2 == ss_dim:
+            integrations.append(None)
+            variances.append(None)
+            coeffs.append(None)
+            new_shoeboxes.append(None)
+            continue
 
         # get the iamge and mask
         shoebox_img = imgs[i_panel][j1:j2, i1:i2] / photon_gain  # NOTE: gain is imortant here!
@@ -218,11 +240,14 @@ def tilt_fit(bbox_expanse, photon_gain, sigma_rdout, zinger_zscore,
         if i_ref % 50 == 0:
             print("Integrated refls %d / %d" % (i_ref+1, n_refl))
 
-    integrations = np.array(integrations)
-    variances = np.array(variances)
-    refls["intensity.sum.value.Leslie99"] = flex.double(integrations)
-    refls["intensity.sum.variance.Leslie99"] = flex.double(variances)
-    refls['shoebox'] = flex.shoebox(new_shoeboxes)
+
+    sel = flex.bool([I is not None for I in integrations])
+    integrations = np.array([I for I in integrations if I is not None])
+    variances = np.array([v for v in variances if v is not None])
+    predicted_refls = predicted_refls.select(sel)
+    predicted_refls["intensity.sum.value.Leslie99"] = flex.double(integrations)
+    predicted_refls["intensity.sum.variance.Leslie99"] = flex.double(variances)
+    predicted_refls['shoebox'] = flex.shoebox([sb for sb in new_shoeboxes if sb is not None])
 
     # assign miller indices to the spots
     #_=refls_to_hkl(refls, detector=exper.detector, beam=exper.beam,
@@ -230,7 +255,7 @@ def tilt_fit(bbox_expanse, photon_gain, sigma_rdout, zinger_zscore,
     El = ExperimentList()
     El.append(exper)
     idx_assign = assign_indices.AssignIndicesGlobal(tolerance=0.333)
-    idx_assign(refls, El)
+    idx_assign(predicted_refls, El)
 
     if plot:
         assert args.minsnr is not None
@@ -266,21 +291,26 @@ def tilt_fit(bbox_expanse, photon_gain, sigma_rdout, zinger_zscore,
         r_patches = []
         snr = integrations / np.sqrt(variances)
         for i_r in range(len(predicted_refls)):
+
             ref = predicted_refls[i_r]
+
             node = exper.detector[ref['panel']]
             pixsize = node.get_pixel_size()[0]
             xpix, ypix, _ = ref['xyzobs.px.value']
 
             xlab, ylab, _ = np.array(node.get_pixel_lab_coord((xpix, ypix)))/pixsize
 
+            i1, i2, j1, j2, _, _ = ref['shoebox'].bbox
+            width = i2-i1
+            height = j2-j1
             if snr[i_r] >= minsnr:
-                r_rect = plt.Rectangle(xy=(ylab - r_sz, xlab - r_sz), width=2 * r_sz,
-                                       height=2 * r_sz, ec=r_color, fc='None')
+                r_rect = plt.Rectangle(xy=(ylab - height/2., xlab - width/2.), width=width,
+                                       height=height, ec=r_color, fc='None')
                 r_patches.append(r_rect)
 
             else:
-                rect = plt.Rectangle(xy=(ylab-rej_sz, xlab-rej_sz), width=2*rej_sz,
-                                 height=2*rej_sz, ec=rej_color, fc='None')
+                rect = plt.Rectangle(xy=(ylab-height/2., xlab-width/2.), width=width,
+                                 height=height, ec=rej_color, fc='None')
                 rej_patches.append(rect)
 
         plt.clf()
@@ -292,7 +322,7 @@ def tilt_fit(bbox_expanse, photon_gain, sigma_rdout, zinger_zscore,
         plt.suptitle("Green: SNR >= %.2f, Orange:SNR < %.2f" % (minsnr, minsnr))
         plt.show()
 
-    return refls, coeffs, integrations, variances
+    return predicted_refls, coeffs, integrations, variances
 
 
 if __name__ == "__main__":
@@ -307,10 +337,8 @@ if __name__ == "__main__":
     refls = flex.reflection_table.from_file("R")
     # first step is to enlarge the shoebox region
 
-    #for r in refls:
-    #    sb.deallocate()
-    experiment = El[0]
-    tilt_fit(
-        expand_fact, GAIN, sigma_readout, outlier_Z,
-        experiment, refls, minsnr=args.minsnr, plot=True,
-        vmin=args.vmin, vmax=args.vmax)
+    _=tilt_fit(
+        imgs=imgs, is_bg_pix=is_bg_pix,
+        delta_q=0.07, photon_gain=GAIN, sigma_rdout=sigma_readout, zinger_zscore=outlier_Z,
+        exper=El[0], predicted_refls=refls, minsnr=args.minsnr,
+        plot=True, vmin=args.vmin, vmax=args.vmax)
