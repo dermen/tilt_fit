@@ -1,13 +1,4 @@
 
-from argparse import ArgumentParser
-
-parser = ArgumentParser("tilt filt")
-parser.add_argument("--filterboundaryspots", action='store_true')
-parser.add_argument("--minsnr", default=1.1, type=float)
-parser.add_argument("--mintilt", default=250, type=float)
-parser.add_argument("--vmax", default=None, type=float)
-parser.add_argument("--vmin", default=None, type=float)
-args = parser.parse_args()
 
 import numpy as np
 import h5py
@@ -39,10 +30,11 @@ def tilt_fit(imgs, is_bg_pix, delta_q, photon_gain, sigma_rdout, zinger_zscore,
              exper, predicted_refls, filter_boundary_spots=False,
              minsnr=None, mintilt=None, plot=False, **kwargs):
 
+    predicted_refls['id'] = flex.int(len(predicted_refls), -1)
+    predicted_refls['imageset_id'] = flex.int(len(predicted_refls), 0)
+    embed()
     predicted_refls.centroid_px_to_mm(exper.detector)
     predicted_refls.map_centroids_to_reciprocal_space(exper.detector, exper.beam)
-    predicted_refls['id'] = flex.int(len(refls), -1)
-    predicted_refls['imageset_id'] = flex.int(len(refls), 0)
     ss_dim, fs_dim = imgs[0].shape
     n_refl = len(predicted_refls)
     integrations = []
@@ -265,6 +257,15 @@ def tilt_fit(imgs, is_bg_pix, delta_q, photon_gain, sigma_rdout, zinger_zscore,
 
 
 if __name__ == "__main__":
+    from argparse import ArgumentParser
+
+    parser = ArgumentParser("tilt filt")
+    parser.add_argument("--filterboundaryspots", action='store_true')
+    parser.add_argument("--minsnr", default=1.1, type=float)
+    parser.add_argument("--mintilt", default=250, type=float)
+    parser.add_argument("--vmax", default=None, type=float)
+    parser.add_argument("--vmin", default=None, type=float)
+    args = parser.parse_args()
     expand_fact = 7
     GAIN = 28
     sigma_readout = 3
