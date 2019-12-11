@@ -32,9 +32,10 @@ def tilt_fit(imgs, is_bg_pix, delta_q, photon_gain, sigma_rdout, zinger_zscore,
 
     predicted_refls['id'] = flex.int(len(predicted_refls), -1)
     predicted_refls['imageset_id'] = flex.int(len(predicted_refls), 0)
-    embed()
-    predicted_refls.centroid_px_to_mm(exper.detector)
-    predicted_refls.map_centroids_to_reciprocal_space(exper.detector, exper.beam)
+    El = ExperimentList()
+    El.append(exper)
+    predicted_refls.centroid_px_to_mm(El)
+    predicted_refls.map_centroids_to_reciprocal_space(El)
     ss_dim, fs_dim = imgs[0].shape
     n_refl = len(predicted_refls)
     integrations = []
@@ -45,7 +46,8 @@ def tilt_fit(imgs, is_bg_pix, delta_q, photon_gain, sigma_rdout, zinger_zscore,
     detdist = exper.detector[0].get_distance()
     pixsize = exper.detector[0].get_pixel_size()[0]
     ave_wave = exper.beam.get_wavelength()
-    for i_ref, ref in enumerate(predicted_refls):
+    for i_ref in range(len(predicted_refls)):
+        ref = predicted_refls[i_ref]
         i1_, i2_, j1_, j2_, _, _ = ref['bbox']  # bbox of prediction
 
         # which detector panel am I on ?
@@ -185,8 +187,6 @@ def tilt_fit(imgs, is_bg_pix, delta_q, photon_gain, sigma_rdout, zinger_zscore,
     predicted_refls["intensity.sum.variance.Leslie99"] = flex.double(variances)
     predicted_refls['shoebox'] = flex.shoebox([sb for sb in new_shoeboxes if sb is not None])
 
-    El = ExperimentList()
-    El.append(exper)
     idx_assign = assign_indices.AssignIndicesGlobal(tolerance=0.333)
     idx_assign(predicted_refls, El)
 
@@ -266,7 +266,6 @@ if __name__ == "__main__":
     parser.add_argument("--vmax", default=None, type=float)
     parser.add_argument("--vmin", default=None, type=float)
     args = parser.parse_args()
-    expand_fact = 7
     GAIN = 28
     sigma_readout = 3
     outlier_Z = np.inf
