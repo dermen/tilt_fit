@@ -27,7 +27,7 @@ def is_outlier(points, thresh=3.5):
 
 
 def tilt_fit(imgs, is_bg_pix, delta_q, photon_gain, sigma_rdout, zinger_zscore,
-             exper, predicted_refls, filter_boundary_spots=False,
+             exper, predicted_refls, sb_pad=0, filter_boundary_spots=False,
              minsnr=None, mintilt=None, plot=False, **kwargs):
 
     predicted_refls['id'] = flex.int(len(predicted_refls), -1)
@@ -59,18 +59,34 @@ def tilt_fit(imgs, is_bg_pix, delta_q, photon_gain, sigma_rdout, zinger_zscore,
         rad2 = (detdist/pixsize) * np.tan(2*np.arcsin((Qmag+delta_q*.5)*ave_wave/4/np.pi))
         bbox_extent = (rad2-rad1) / np.sqrt(2)   # rad2 - rad1 is the diagonal across the bbox
         i_com, j_com, _ = ref['xyzobs.px.value']
-        #i_com = (i1_ + i2_)*.5
-        #j_com = (j1_ + j2_)*.5
         i_low = int(i_com - bbox_extent/2.)
         i_high = int(i_com + bbox_extent/2.)
         j_low = int(j_com - bbox_extent/2.)
         j_high = int(j_com + bbox_extent/2.)
-        # expand bbox a bit to include more bg pix
-        # trim bbox if its along edge of detector
+
+        i1_orig = max(i_low, 0)
+        i2_orig = min(i_high, fs_dim)
+        j1_orig = max(j_low, 0)
+        j2_orig = min(j_high, ss_dim)
+
+        i_low = i_low - sb_pad
+        i_high = i_high + sb_pad
+        j_low = j_low - sb_pad
+        j_high = j_high + sb_pad
+
         i1 = max(i_low, 0)
         i2 = min(i_high, fs_dim)
         j1 = max(j_low, 0)
         j2 = min(j_high, ss_dim)
+
+        i1_p = i1_orig - i1
+        i2_p = i1_p + i2_orig-i1_orig
+        j1_p = j1_orig - j1
+        j2_p = j1_p + j2_orig-j1_orig
+        i1_orig = i1_p
+        i2_orig = i2_p
+        j1_orig = j1_p
+        j2_orig = j2_p
 
         if filter_boundary_spots:
             if i1 == 0 or i2 == fs_dim or j1 == 0 or j2 == ss_dim:
@@ -91,9 +107,10 @@ def tilt_fit(imgs, is_bg_pix, delta_q, photon_gain, sigma_rdout, zinger_zscore,
 
         dials_mask[shoebox_mask] = dials_mask[shoebox_mask] + MaskCode.Background
 
-        new_shoebox = Shoebox((i1, i2, j1, j2, 0, 1))
+        new_shoebox = Shoebox((i1_orig, i2_orig, j1_orig, j2_orig, 0, 1))
         new_shoebox.allocate()
-        new_shoebox.data = flex.float(shoebox_img[None,])
+        new_shoebox.data = flex.float(np.ascontiguousarray(shoebox_img[None, j1_orig:j2_orig, i1_orig: i2_orig]))
+        #new_shoebox.data = flex.float(shoebox_img[None,])
 
         # get coordinates arrays of the image
         Y, X = np.indices(shoebox_img.shape)
@@ -129,7 +146,7 @@ def tilt_fit(imgs, is_bg_pix, delta_q, photon_gain, sigma_rdout, zinger_zscore,
         X1d = np.ravel(X)
         Y1d = np.ravel(Y)
         background = (X1d * a + Y1d * b + c).reshape(shoebox_img.shape)
-        new_shoebox.background = flex.float(background[None, ])
+        new_shoebox.background = flex.float(np.ascontiguousarray(background[None, j1_orig: j2_orig, i1_orig:i2_orig]))
 
         # vector of residuals
         r = rho_bg - np.dot(A, (a, b, c))
@@ -170,7 +187,7 @@ def tilt_fit(imgs, is_bg_pix, delta_q, photon_gain, sigma_rdout, zinger_zscore,
 
         integrations.append(Isum)
         variances.append(var_Isum)
-        new_shoebox.mask = flex.int(dials_mask[None,])
+        new_shoebox.mask = flex.int(np.ascontiguousarray(dials_mask[None, j1_orig:j2_orig, i1_orig:i2_orig]))
         new_shoeboxes.append(new_shoebox)
 
         if i_ref % 50 == 0:
@@ -278,5 +295,6 @@ if __name__ == "__main__":
     res = tilt_fit(
         imgs=imgs, is_bg_pix=is_bg_pix,
         delta_q=0.07, photon_gain=GAIN, sigma_rdout=sigma_readout, zinger_zscore=outlier_Z,
-        exper=El[0], predicted_refls=refls, filter_boundary_spots=args.filterboundaryspots,
+        exper=El[0], predicted_refls=refls, sb_pad=5, filter_boundary_spots=args.filterboundaryspots,
         minsnr=args.minsnr, mintilt=args.mintilt, plot=True, vmin=args.vmin, vmax=args.vmax)
+    embed()
