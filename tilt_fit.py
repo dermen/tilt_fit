@@ -28,7 +28,7 @@ def is_outlier(points, thresh=3.5):
 
 def tilt_fit(imgs, is_bg_pix, delta_q, photon_gain, sigma_rdout, zinger_zscore,
              exper, predicted_refls, sb_pad=0, filter_boundary_spots=False,
-             minsnr=None, mintilt=None, plot=False, **kwargs):
+             minsnr=None, mintilt=None, plot=False,verbose=False, **kwargs):
 
     predicted_refls['id'] = flex.int(len(predicted_refls), -1)
     predicted_refls['imageset_id'] = flex.int(len(predicted_refls), 0)
@@ -43,6 +43,7 @@ def tilt_fit(imgs, is_bg_pix, delta_q, photon_gain, sigma_rdout, zinger_zscore,
     coeffs = []
     new_shoeboxes = []
     tilt_error = []
+    boundary = []
     detdist = exper.detector[0].get_distance()
     pixsize = exper.detector[0].get_pixel_size()[0]
     ave_wave = exper.beam.get_wavelength()
@@ -59,6 +60,8 @@ def tilt_fit(imgs, is_bg_pix, delta_q, photon_gain, sigma_rdout, zinger_zscore,
         rad2 = (detdist/pixsize) * np.tan(2*np.arcsin((Qmag+delta_q*.5)*ave_wave/4/np.pi))
         bbox_extent = (rad2-rad1) / np.sqrt(2)   # rad2 - rad1 is the diagonal across the bbox
         i_com, j_com, _ = ref['xyzobs.px.value']
+        i_com = i_com - 0.5
+        j_com = j_com - 0.5
         i_low = int(i_com - bbox_extent/2.)
         i_high = int(i_com + bbox_extent/2.)
         j_low = int(j_com - bbox_extent/2.)
@@ -84,14 +87,17 @@ def tilt_fit(imgs, is_bg_pix, delta_q, photon_gain, sigma_rdout, zinger_zscore,
         j1_p = j1_orig - j1
         j2_p = j1_p + j2_orig-j1_orig
 
-        if filter_boundary_spots:
-            if i1 == 0 or i2 == fs_dim or j1 == 0 or j2 == ss_dim:
+        if i1 == 0 or i2 == fs_dim or j1 == 0 or j2 == ss_dim:
+            boundary.append(True)
+            if filter_boundary_spots:
                 integrations.append(None)
                 variances.append(None)
                 coeffs.append(None)
                 new_shoeboxes.append(None)
                 tilt_error.append(None)
                 continue
+        else:
+            boundary.append(False)
 
         # get the iamge and mask
         shoebox_img = imgs[i_panel][j1:j2, i1:i2] / photon_gain  # NOTE: gain is imortant here!
@@ -186,20 +192,22 @@ def tilt_fit(imgs, is_bg_pix, delta_q, photon_gain, sigma_rdout, zinger_zscore,
         new_shoebox.mask = flex.int(np.ascontiguousarray(dials_mask[None, j1_p:j2_p, i1_p:i2_p]))
         new_shoeboxes.append(new_shoebox)
 
-        if i_ref % 50 == 0:
+        if i_ref % 50 == 0 and verbose:
             print("Integrated refls %d / %d" % (i_ref+1, n_refl))
 
+    if filter_boundary_spots:
+        sel = flex.bool([I is not None for I in integrations])
+        integrations = np.array([I for I in integrations if I is not None])
+        variances = np.array([v for v in variances if v is not None])
+        coeffs = np.array([c for c in coeffs if c is not None])
+        tilt_error = np.array([te for te in tilt_error if te is not None])
+        boundary = np.zeros(tilt_error.shape).astype(np.bool)
+        predicted_refls = predicted_refls.select(sel)
 
-    sel = flex.bool([I is not None for I in integrations])
-    integrations = np.array([I for I in integrations if I is not None])
-    variances = np.array([v for v in variances if v is not None])
-    coeffs = np.array([c for c in coeffs if c is not None])
-    tilt_error = np.array([te for te in tilt_error if te is not None])
-    predicted_refls = predicted_refls.select(sel)
+    predicted_refls['boundary'] = flex.bool(boundary)
     predicted_refls["intensity.sum.value.Leslie99"] = flex.double(integrations)
     predicted_refls["intensity.sum.variance.Leslie99"] = flex.double(variances)
     predicted_refls['shoebox'] = flex.shoebox([sb for sb in new_shoeboxes if sb is not None])
-
     idx_assign = assign_indices.AssignIndicesGlobal(tolerance=0.333)
     idx_assign(predicted_refls, El)
 
@@ -240,7 +248,8 @@ def tilt_fit(imgs, is_bg_pix, delta_q, photon_gain, sigma_rdout, zinger_zscore,
             node = exper.detector[ref['panel']]
             pixsize = node.get_pixel_size()[0]
             xpix, ypix, _ = ref['xyzobs.px.value']
-
+            xpix = xpix - 0.5
+            ypix = ypix - 0.5
             xlab, ylab, _ = np.array(node.get_pixel_lab_coord((xpix, ypix)))/pixsize
 
             # FIXME: something weird with the display on CSPADs, to do with fast /slow scan vectors?
