@@ -83,10 +83,6 @@ def tilt_fit(imgs, is_bg_pix, delta_q, photon_gain, sigma_rdout, zinger_zscore,
         i2_p = i1_p + i2_orig-i1_orig
         j1_p = j1_orig - j1
         j2_p = j1_p + j2_orig-j1_orig
-        i1_orig = i1_p
-        i2_orig = i2_p
-        j1_orig = j1_p
-        j2_orig = j2_p
 
         if filter_boundary_spots:
             if i1 == 0 or i2 == fs_dim or j1 == 0 or j2 == ss_dim:
@@ -109,7 +105,7 @@ def tilt_fit(imgs, is_bg_pix, delta_q, photon_gain, sigma_rdout, zinger_zscore,
 
         new_shoebox = Shoebox((i1_orig, i2_orig, j1_orig, j2_orig, 0, 1))
         new_shoebox.allocate()
-        new_shoebox.data = flex.float(np.ascontiguousarray(shoebox_img[None, j1_orig:j2_orig, i1_orig: i2_orig]))
+        new_shoebox.data = flex.float(np.ascontiguousarray(shoebox_img[None, j1_p:j2_p, i1_p: i2_p]))
         #new_shoebox.data = flex.float(shoebox_img[None,])
 
         # get coordinates arrays of the image
@@ -146,7 +142,7 @@ def tilt_fit(imgs, is_bg_pix, delta_q, photon_gain, sigma_rdout, zinger_zscore,
         X1d = np.ravel(X)
         Y1d = np.ravel(Y)
         background = (X1d * a + Y1d * b + c).reshape(shoebox_img.shape)
-        new_shoebox.background = flex.float(np.ascontiguousarray(background[None, j1_orig: j2_orig, i1_orig:i2_orig]))
+        new_shoebox.background = flex.float(np.ascontiguousarray(background[None, j1_p: j2_p, i1_p:i2_p]))
 
         # vector of residuals
         r = rho_bg - np.dot(A, (a, b, c))
@@ -187,7 +183,7 @@ def tilt_fit(imgs, is_bg_pix, delta_q, photon_gain, sigma_rdout, zinger_zscore,
 
         integrations.append(Isum)
         variances.append(var_Isum)
-        new_shoebox.mask = flex.int(np.ascontiguousarray(dials_mask[None, j1_orig:j2_orig, i1_orig:i2_orig]))
+        new_shoebox.mask = flex.int(np.ascontiguousarray(dials_mask[None, j1_p:j2_p, i1_p:i2_p]))
         new_shoeboxes.append(new_shoebox)
 
         if i_ref % 50 == 0:
