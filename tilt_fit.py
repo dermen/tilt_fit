@@ -49,7 +49,12 @@ def tilt_fit(imgs, is_bg_pix, delta_q, photon_gain, sigma_rdout, zinger_zscore,
     ave_wave = exper.beam.get_wavelength()
     for i_ref in range(len(predicted_refls)):
         ref = predicted_refls[i_ref]
-        i1_, i2_, j1_, j2_, _, _ = ref['bbox']  # bbox of prediction
+        i1_a, i2_a, j1_a, j2_a, _, _ = ref['bbox']  # bbox of prediction
+
+        i1_ = max(i1_a, 0)
+        i2_ = min(i2_a, fs_dim-1)
+        j1_ = max(j1_a, 0)
+        j2_ = min(j2_a, ss_dim-1)
 
         # which detector panel am I on ?
         i_panel = ref['panel']
@@ -68,9 +73,9 @@ def tilt_fit(imgs, is_bg_pix, delta_q, photon_gain, sigma_rdout, zinger_zscore,
         j_high = int(j_com + bbox_extent/2.)
 
         i1_orig = max(i_low, 0)
-        i2_orig = min(i_high, fs_dim)
+        i2_orig = min(i_high, fs_dim-1)
         j1_orig = max(j_low, 0)
-        j2_orig = min(j_high, ss_dim)
+        j2_orig = min(j_high, ss_dim-1)
 
         i_low = i_low - sb_pad
         i_high = i_high + sb_pad
@@ -78,9 +83,9 @@ def tilt_fit(imgs, is_bg_pix, delta_q, photon_gain, sigma_rdout, zinger_zscore,
         j_high = j_high + sb_pad
 
         i1 = max(i_low, 0)
-        i2 = min(i_high, fs_dim)
+        i2 = min(i_high, fs_dim-1)
         j1 = max(j_low, 0)
-        j2 = min(j_high, ss_dim)
+        j2 = min(j_high, ss_dim-1)
 
         i1_p = i1_orig - i1
         i2_p = i1_p + i2_orig-i1_orig
@@ -159,12 +164,27 @@ def tilt_fit(imgs, is_bg_pix, delta_q, photon_gain, sigma_rdout, zinger_zscore,
         abc_var = var_covar[0][0], var_covar[1][1], var_covar[2][2]
 
         # place the strong spot mask in the expanded shoebox
-        peak_mask = ref['shoebox'].mask.as_numpy_array()[0] == 5
+        peak_mask = ref['shoebox'].mask.as_numpy_array()[0] == MaskCode.Valid + MaskCode.Foreground
+        peak_mask_valid = peak_mask[j1_-j1_a:- j1_a + j2_, i1_-i1_a:-i1_a + i2_]
         peak_mask_expanded = np.zeros_like(shoebox_mask)
-        Nj, Ni = j2_ - j1_, i2_ - i1_
-        jstart = j1_ - j1
-        istart = i1_ - i1
-        peak_mask_expanded[jstart:jstart+Nj, istart: istart+Ni] = peak_mask
+
+        # overlap region
+        i1_o = max(i1_, i1)
+        i2_o = min(i2_, i2)
+        j1_o = max(j1_, j1)
+        j2_o = min(j2_, j2)
+
+        pk_mask_istart = i1_o - i1_
+        pk_mask_jstart = j1_o - j1_
+        pk_mask_istop = peak_mask_valid.shape[1] - (i2_ - i2_o)
+        pk_mask_jstop = peak_mask_valid.shape[0] - (j2_ - j2_o)
+        peak_mask_overlap = peak_mask_valid[pk_mask_jstart: pk_mask_jstop, pk_mask_istart: pk_mask_istop]
+
+        pk_mask_exp_i1 = i1_o - i1
+        pk_mask_exp_j1 = j1_o - j1
+        pk_mask_exp_i2 = peak_mask_expanded.shape[1] - (i2 - i2_o)
+        pk_mask_exp_j2 = peak_mask_expanded.shape[0] - (j2 - j2_o)
+        peak_mask_expanded[pk_mask_exp_j1: pk_mask_exp_j2, pk_mask_exp_i1: pk_mask_exp_i2] = peak_mask_overlap
 
         # update the dials mask
         dials_mask[peak_mask_expanded] = dials_mask[peak_mask_expanded] + MaskCode.Foreground
