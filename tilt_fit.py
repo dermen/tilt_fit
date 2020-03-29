@@ -1,6 +1,7 @@
 
 
 import numpy as np
+from IPython import embed
 import h5py
 import pylab as plt
 from scipy.spatial import cKDTree
@@ -142,7 +143,7 @@ def tilt_fit(imgs, is_bg_pix, delta_q, photon_gain, sigma_rdout, zinger_zscore,
 
         # initially all pixels are valid
         dials_mask += MaskCode.Valid
-        shoebox_mask = is_bg_pix[i_panel, j1:j2, i1:i2]
+        shoebox_mask = is_bg_pix[i_panel][j1:j2, i1:i2]
 
         badpix_mask = is_BAD_pix[i_panel, j1:j2, i1:i2]
 
