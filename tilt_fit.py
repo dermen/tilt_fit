@@ -3,6 +3,7 @@
 import numpy as np
 import h5py
 import pylab as plt
+from scipy.spatial import cKDTree
 from IPython import embed
 
 from dxtbx.model.experiment_list import ExperimentList, ExperimentListFactory
@@ -28,7 +29,11 @@ def is_outlier(points, thresh=3.5):
 
 def tilt_fit(imgs, is_bg_pix, delta_q, photon_gain, sigma_rdout, zinger_zscore,
              exper, predicted_refls, sb_pad=0, filter_boundary_spots=False,
-             minsnr=None, mintilt=None, plot=False,verbose=False, **kwargs):
+             minsnr=None, mintilt=None, plot=False, verbose=False, is_BAD_pix=None,
+             min_strong=None, min_bg=10, min_dist_to_bad_pix=7, **kwargs):
+
+    if is_BAD_pix is None:
+        is_BAD_pix = np.zeros(is_bg_pix.shape, np.bool)
 
     predicted_refls['id'] = flex.int(len(predicted_refls), -1)
     predicted_refls['imageset_id'] = flex.int(len(predicted_refls), 0)
@@ -47,8 +52,38 @@ def tilt_fit(imgs, is_bg_pix, delta_q, photon_gain, sigma_rdout, zinger_zscore,
     detdist = exper.detector[0].get_distance()
     pixsize = exper.detector[0].get_pixel_size()[0]
     ave_wave = exper.beam.get_wavelength()
+
+    bad_trees = {}
+    unique_panels = set(predicted_refls["panel"])
+    for p in unique_panels:
+        panel_bad_pix = is_BAD_pix[p]
+        ybad, xbad = np.where(is_BAD_pix[0])
+        if ybad.size:
+            bad_pts = zip(ybad, xbad)
+            bad_trees[p] = cKDTree(bad_pts)
+        else:
+            bad_trees[p] = None
+
+    sel = []
+
     for i_ref in range(len(predicted_refls)):
         ref = predicted_refls[i_ref]
+        i_com, j_com, _ = ref['xyzobs.px.value']
+
+        # which detector panel am I on ?
+        i_panel = ref['panel']
+
+        if bad_trees[i_panel] is not None:
+            if bad_trees[i_panel].query_ball_point((i_com, j_com), r=min_dist_to_bad_pix):
+                sel.append(False)
+                integrations.append(None)
+                variances.append(None)
+                coeffs.append(None)
+                new_shoeboxes.append(None)
+                tilt_error.append(None)
+                boundary.append(None)
+                continue
+
         i1_a, i2_a, j1_a, j2_a, _, _ = ref['bbox']  # bbox of prediction
 
         i1_ = max(i1_a, 0)
@@ -56,15 +91,11 @@ def tilt_fit(imgs, is_bg_pix, delta_q, photon_gain, sigma_rdout, zinger_zscore,
         j1_ = max(j1_a, 0)
         j2_ = min(j2_a, ss_dim-1)
 
-        # which detector panel am I on ?
-        i_panel = ref['panel']
-
         # get the number of pixels spanning the box in pixels
         Qmag = 2*np.pi*np.linalg.norm(ref['rlp'])  # magnitude momentum transfer of the RLP in physicist convention
         rad1 = (detdist/pixsize) * np.tan(2*np.arcsin((Qmag-delta_q*.5)*ave_wave/4/np.pi))
         rad2 = (detdist/pixsize) * np.tan(2*np.arcsin((Qmag+delta_q*.5)*ave_wave/4/np.pi))
         bbox_extent = (rad2-rad1) / np.sqrt(2)   # rad2 - rad1 is the diagonal across the bbox
-        i_com, j_com, _ = ref['xyzobs.px.value']
         i_com = i_com - 0.5
         j_com = j_com - 0.5
         i_low = int(i_com - bbox_extent/2.)
@@ -95,6 +126,7 @@ def tilt_fit(imgs, is_bg_pix, delta_q, photon_gain, sigma_rdout, zinger_zscore,
         if i1 == 0 or i2 == fs_dim or j1 == 0 or j2 == ss_dim:
             boundary.append(True)
             if filter_boundary_spots:
+                sel.append(False)
                 integrations.append(None)
                 variances.append(None)
                 coeffs.append(None)
@@ -108,9 +140,11 @@ def tilt_fit(imgs, is_bg_pix, delta_q, photon_gain, sigma_rdout, zinger_zscore,
         shoebox_img = imgs[i_panel][j1:j2, i1:i2] / photon_gain  # NOTE: gain is imortant here!
         dials_mask = np.zeros(shoebox_img.shape).astype(np.int32)
 
-        # initially all pixels are valie
+        # initially all pixels are valid
         dials_mask += MaskCode.Valid
         shoebox_mask = is_bg_pix[i_panel, j1:j2, i1:i2]
+
+        badpix_mask = is_BAD_pix[i_panel, j1:j2, i1:i2]
 
         dials_mask[shoebox_mask] = dials_mask[shoebox_mask] + MaskCode.Background
 
@@ -130,8 +164,21 @@ def tilt_fit(imgs, is_bg_pix, delta_q, photon_gain, sigma_rdout, zinger_zscore,
         out1d[mask1d] = is_outlier(img1d[mask1d].ravel(), zinger_zscore)
         out2d = out1d.reshape(shoebox_img.shape)
 
+        # combine bad2d with badpix mask
+        out2d = np.logical_or(out2d, badpix_mask)
+
         # these are points we fit to: both zingers and original mask
         fit_sel = np.logical_and(~out2d, shoebox_mask)  # fit plane to these points, no outliers, no masked
+
+        if np.sum(fit_sel) < min_bg:
+            integrations.append(None)
+            variances.append(None)
+            coeffs.append(None)
+            new_shoeboxes.append(None)
+            tilt_error.append(None)
+            sel.append(False)
+            continue
+
         # update the dials mask...
         dials_mask[fit_sel] = dials_mask[fit_sel] + MaskCode.BackgroundUsed
 
@@ -140,11 +187,23 @@ def tilt_fit(imgs, is_bg_pix, delta_q, photon_gain, sigma_rdout, zinger_zscore,
 
         # do the fit of the background plane
         A = np.array([fast, slow, np.ones_like(fast)]).T
-
         # weights matrix:
         W = np.diag(1 / (sigma_rdout ** 2 + rho_bg))
         AWA = np.dot(A.T, np.dot(W, A))
-        AWA_inv = np.linalg.inv(AWA)
+        try:
+            AWA_inv = np.linalg.inv(AWA)
+        except np.linalg.LinAlgError:
+            print "WARNING: Fit did not work.. investigate reflection"
+            print ref
+            integrations.append(None)
+            variances.append(None)
+            coeffs.append(None)
+            new_shoeboxes.append(None)
+            tilt_error.append(None)
+            sel.append(False)
+            continue
+
+
         AtW = np.dot(A.T, W)
         a, b, c = np.dot(np.dot(AWA_inv, AtW), rho_bg)
         coeffs.append((a, b, c))
@@ -211,18 +270,25 @@ def tilt_fit(imgs, is_bg_pix, delta_q, photon_gain, sigma_rdout, zinger_zscore,
         variances.append(var_Isum)
         new_shoebox.mask = flex.int(np.ascontiguousarray(dials_mask[None, j1_p:j2_p, i1_p:i2_p]))
         new_shoeboxes.append(new_shoebox)
+        sel.append(True)
 
         if i_ref % 50 == 0 and verbose:
             print("Integrated refls %d / %d" % (i_ref+1, n_refl))
 
-    if filter_boundary_spots:
-        sel = flex.bool([I is not None for I in integrations])
-        integrations = np.array([I for I in integrations if I is not None])
-        variances = np.array([v for v in variances if v is not None])
-        coeffs = np.array([c for c in coeffs if c is not None])
-        tilt_error = np.array([te for te in tilt_error if te is not None])
-        boundary = np.zeros(tilt_error.shape).astype(np.bool)
-        predicted_refls = predicted_refls.select(sel)
+
+    #if filter_boundary_spots:
+    #    sel = flex.bool([I is not None for I in integrations])
+    boundary = np.array(boundary)[sel].astype(bool)
+    integrations = np.array([I for I in integrations if I is not None])
+    variances = np.array([v for v in variances if v is not None])
+    coeffs = np.array([c for c in coeffs if c is not None])
+    tilt_error = np.array([te for te in tilt_error if te is not None])
+
+    #boundary = np.zeros(tilt_error.shape).astype(np.bool)
+
+    predicted_refls = predicted_refls.select(flex.bool(sel))
+
+    predicted_refls['resolution'] = flex.double( 1/ np.linalg.norm(predicted_refls['rlp'], axis=1))
 
     predicted_refls['boundary'] = flex.bool(boundary)
     predicted_refls["intensity.sum.value.Leslie99"] = flex.double(integrations)
@@ -322,4 +388,3 @@ if __name__ == "__main__":
         delta_q=0.07, photon_gain=GAIN, sigma_rdout=sigma_readout, zinger_zscore=outlier_Z,
         exper=El[0], predicted_refls=refls, sb_pad=5, filter_boundary_spots=args.filterboundaryspots,
         minsnr=args.minsnr, mintilt=args.mintilt, plot=True, vmin=args.vmin, vmax=args.vmax)
-    embed()
