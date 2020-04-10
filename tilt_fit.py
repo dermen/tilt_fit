@@ -194,8 +194,8 @@ def tilt_fit(imgs, is_bg_pix, delta_q, photon_gain, sigma_rdout, zinger_zscore,
         try:
             AWA_inv = np.linalg.inv(AWA)
         except np.linalg.LinAlgError:
-            print "WARNING: Fit did not work.. investigate reflection"
-            print ref
+            print ( "WARNING: Fit did not work.. investigate reflection")
+            print (ref)
             integrations.append(None)
             variances.append(None)
             coeffs.append(None)
