@@ -727,6 +727,13 @@ if __name__ == "__main__":
     data = {"panel": panels, "shoebox_roi": bboxes, "integration": integrations, "variance": variances,
             "tilt_errors": tilt_error, "xyzobs.px.value": xyzobs, "snr": snr, "dips_below_zero": dips_below_zero}
     df = pandas.DataFrame(data)
+    shoeboxes = []
+    for i1,i2,j1,j2 in bboxes:
+        new_shoebox = Shoebox((i1,i2, j1, j2, 0, 1))
+        new_shoebox.allocate()
+        shoeboxes.append(new_shoebox)
+
+    embed()
 
     if not args.plotassembled:
         #from cxid9114.prediction import prediction_utils
