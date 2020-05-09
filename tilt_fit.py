@@ -5,7 +5,6 @@ from IPython import embed
 import h5py
 import pylab as plt
 from scipy.spatial import cKDTree
-from IPython import embed
 
 from dxtbx.model.experiment_list import ExperimentList, ExperimentListFactory
 from dials.array_family import flex
@@ -52,6 +51,7 @@ class TiltPlanes:
         self.delta_Q = 0.06  # inverse Angstrom
         self.sigma_rdout = 3  # readout noise of the pixel
         self.zinger_zscore = 5
+        self.tilt_dips_below_zero = False  # during integration we check if tilt plane dips below 0 and set this flag
         self.min_dist_to_bad_pix = 7
 
 
@@ -196,7 +196,8 @@ class TiltPlanes:
 
     def determine_shoebox_ROI(self):
         width = self._get_width_of_shoebox(self.refl["rlp"])
-        i1, i2, j1, j2 = self.i_com - width/2., self.i_com + width/2., self.j_com - width/2., self.j_com + width/2.
+        wby2 = int(round(width/2.))
+        i1, i2, j1, j2 = self.i_com - wby2, self.i_com + wby2, self.j_com - wby2, self.j_com + wby2
         i1 = max(int(i1), 0)
         i2 = min(int(i2), self.fdim - 1)
         j1 = max(int(j1), 0)
@@ -257,15 +258,22 @@ class TiltPlanes:
         Ns = len(rho_peak)  # number of integrated peak pixels
 
         # variance propagated from tilt plane constants
-        var_a_term = self.variance_matrix[0] * ((np.sum(p)) ** 2)
-        var_b_term = self.variance_matrix[1] * ((np.sum(q)) ** 2)
-        var_c_term = self.variance_matrix[2] * (Ns ** 2)
+        var_a_term = self.variance_matrix[0, 0] * ((np.sum(p)) ** 2)
+        var_b_term = self.variance_matrix[1, 1] * ((np.sum(q)) ** 2)
+        var_c_term = self.variance_matrix[2, 2] * (Ns ** 2)
 
         # total variance of the spot
         var_Isum = np.sum(var_rho_peak) + var_a_term + var_b_term + var_c_term
 
         return Isum, var_Isum
 
+    def _check_if_tilt_dips_below_zero(self):
+        tX, tY, tZ = self.coefs
+        tilt_plane = self.X*tX + self.Y*tY + tZ
+        if np.min(tilt_plane) < 0:
+            self.tilt_dips_below_zero = True
+        else:
+            self.tilt_dips_below_zero = False
 
     def integrate_shoebox(self, refl):
         if self.pixsize_mm is None:
@@ -292,6 +300,7 @@ class TiltPlanes:
 
         #integration_window = refl["bbox"]
         shoebox_roi = self.determine_shoebox_ROI()
+        print(shoebox_roi[1]-shoebox_roi[0], shoebox_roi[3] - shoebox_roi[2])
         sX = slice(shoebox_roi[0], shoebox_roi[1], 1)
         sY = slice(shoebox_roi[2], shoebox_roi[3], 1)
 
@@ -324,13 +333,15 @@ class TiltPlanes:
 
         Isum, varIsum = self._integrate()
 
+        self._check_if_tilt_dips_below_zero()
+
         # returns 5 objects:
         #  -the shoebox ROI (fast1,fast2,slow1,slow2)
         #  -the tilt coefficients (t1,t2,t3) where t1 is for fast coord, t2 is for slow coord, t3 is height)
         #  -the variance matrix from the least squares determination of the coefficients
         #  -the integrated I (summed intensity of Bragg peak)
         #  -the variance of integrated I
-        return shoebox_roi, self.coefs, self.variance_matrix, Isum, varIsum
+        return shoebox_roi, self.coefs, self.variance_matrix, Isum, varIsum, self.tilt_dips_below_zero
 
     @staticmethod
     def prep_relfs_for_tiltalization(predicted_refls, exper):
@@ -340,6 +351,8 @@ class TiltPlanes:
         El.append(exper)
         predicted_refls.centroid_px_to_mm(El)
         predicted_refls.map_centroids_to_reciprocal_space(El)
+        idx_assign = assign_indices.AssignIndicesGlobal(tolerance=0.333)
+        idx_assign(predicted_refls, El)
         return predicted_refls
 
 
@@ -610,71 +623,7 @@ class TiltPlanes:
 #    idx_assign = assign_indices.AssignIndicesGlobal(tolerance=0.333)
 #    idx_assign(predicted_refls, El)
 #
-#    if plot:
-#        assert minsnr is not None
-#        assert mintilt is not None
-#        all_xx = []
-#        all_yy = []
-#        for i_panel in range(len(imgs)):
-#            node = exper.detector[i_panel]
-#            pix = node.get_pixel_size()[0]
-#            fs = np.array(node.get_fast_axis())
-#            ss = np.array(node.get_slow_axis())
-#            o = np.array(node.get_origin()) / pix
-#
-#            Nfs, Nss = node.get_image_size()
-#            Y, X = np.indices((Nss, Nfs))
-#            xx = fs[0] * X + ss[0] * Y + o[0]
-#            yy = fs[1] * X + ss[1] * Y + o[1]
-#            all_xx.append(xx)
-#            all_yy.append(yy)
-#        all_xx = np.array(all_xx)
-#        all_yy = np.array(all_yy)
-#
-#        binsX = np.arange(int(np.min(all_xx)), int(np.max(all_xx)), 1)
-#        binsY = np.arange(int(np.min(all_yy)), int(np.max(all_yy)), 1)
-#        out = np.histogram2d(all_xx.ravel(), all_yy.ravel(), bins=(binsX, binsY), weights=imgs.ravel())
-#
-#        r_color = 'Limegreen'
-#        rej_color = 'Darkorange'
-#        rej_patches = []
-#        r_patches = []
-#        snr = integrations / np.sqrt(variances)
-#        for i_r in range(len(predicted_refls)):
-#
-#            ref = predicted_refls[i_r]
-#
-#            node = exper.detector[ref['panel']]
-#            pixsize = node.get_pixel_size()[0]
-#            xpix, ypix, _ = ref['xyzobs.px.value']
-#            xpix = xpix - 0.5
-#            ypix = ypix - 0.5
-#            xlab, ylab, _ = np.array(node.get_pixel_lab_coord((xpix, ypix)))/pixsize
-#
-#            # FIXME: something weird with the display on CSPADs, to do with fast /slow scan vectors?
-#            i1, i2, j1, j2, _, _ = ref['shoebox'].bbox
-#            width = i2-i1
-#            height = j2-j1
-#            if snr[i_r] >= minsnr and tilt_error[i_r] <= mintilt:
-#                r_rect = plt.Rectangle(xy=(ylab - height/2., xlab - width/2.), width=width,
-#                                       height=height, ec=r_color, fc='None')
-#                r_patches.append(r_rect)
-#
-#            else:
-#                rect = plt.Rectangle(xy=(ylab-height/2., xlab-width/2.), width=width,
-#                                 height=height, ec=rej_color, fc='None')
-#                rej_patches.append(rect)
-#
-#        plt.clf()
-#        plt.imshow(out[0], extent=(out[2][0], out[2][-1], out[1][-1], out[1][0]), **kwargs)
-#        coll = plt.mpl.collections.PatchCollection(rej_patches, match_original=True)
-#        r_coll = plt.mpl.collections.PatchCollection(r_patches, match_original=True)
-#        plt.gca().add_collection(coll)
-#        plt.gca().add_collection(r_coll)
-#        plt.suptitle("Green: SNR >= %.2f, Orange:SNR < %.2f" % (minsnr, minsnr))
-#        plt.show()
-#
-#    return predicted_refls, coeffs, tilt_error, integrations, variances
+
 
 
 if __name__ == "__main__":
@@ -683,9 +632,11 @@ if __name__ == "__main__":
     parser = ArgumentParser("tilt filt")
     parser.add_argument("--filterboundaryspots", action='store_true')
     parser.add_argument("--minsnr", default=1.1, type=float)
-    parser.add_argument("--mintilt", default=250, type=float)
-    parser.add_argument("--vmax", default=None, type=float)
+    parser.add_argument("--mintilt", default=10000, type=float)
+    parser.add_argument("--vmax", default=250, type=float)
     parser.add_argument("--vmin", default=None, type=float)
+    parser.add_argument("--pause", default=0.3, type=float)
+    parser.add_argument("--plotassembled", action="store_true")
     args = parser.parse_args()
     GAIN = 28
     sigma_readout = 3
@@ -703,7 +654,7 @@ if __name__ == "__main__":
     tiltnation.make_quick_bad_pixel_proximity_checker(refls)
     tiltnation.sigma_rdout = sigma_readout
     tiltnation.adu_per_photon = GAIN
-    tiltnation.delta_Q = 0.085
+    tiltnation.delta_Q = 0.06
     tiltnation.zinger_zscore = outlier_Z
     tiltnation.pixsize_mm = El.detectors()[0][0].get_pixel_size()[0]
     tiltnation.ave_wavelength_A = El.beams()[0].get_wavelength()
@@ -714,12 +665,32 @@ if __name__ == "__main__":
     Nrefl = len(refls)
     all_residual = []
     mins = []
+    integrations = []
+    variances = []
+    tilt_error =[]
+    from dials.array_family import flex
+    sel = []
+    import pandas
+    panels = []
+    bboxes = []
+    xyzobs =[]
+    dips_below_zero = []
+
     for i_r in range(Nrefl):
         ref = refls[i_r]
         result = tiltnation.integrate_shoebox(ref)
         if result is None:
+            ref["snr"] = -999 #np.inf
+            ref["tilt_error"] = 999 #np.inf
+            ref["shoebox_roi"] = 0,1,0,1,0,1
+            below_zero_flag = None
             continue
-        shoebox_roi, coefs, variance_matrix, Isum, varIsum = result
+        shoebox_roi, coefs, variance_matrix, Isum, varIsum, below_zero_flag = result
+        dips_below_zero.append(below_zero_flag)
+        bboxes.append(list(shoebox_roi))
+        integrations.append(Isum)
+        variances.append(varIsum)
+        tilt_error.append(np.diag(variance_matrix).sum())
 
         x1, x2, y1, y2 = shoebox_roi
         Y, X = np.indices((y2-y1, x2-x1)) #range(x1, x2), range(y1, y2))
@@ -745,10 +716,126 @@ if __name__ == "__main__":
             print("")
 
         all_residual.append(np.mean(residual))
-    embed()
+        ref["snr"] = np.nan_to_num(Isum / varIsum)
+        ref["tilt_error"] = np.diag(variance_matrix).sum()
+        ref["shoebox_roi"] = shoebox_roi
 
-    #res = tilt_fit(
-    #    imgs=imgs, is_bg_pix=is_bg_pix,
+        panels.append(ref["panel"])
+        xyzobs.append(list(ref["xyzobs.px.value"]))
+
+    snr = np.array(integrations) / np.sqrt(variances)
+    data = {"panel": panels, "shoebox_roi": bboxes, "integration": integrations, "variance": variances,
+            "tilt_errors": tilt_error, "xyzobs.px.value": xyzobs, "snr": snr, "dips_below_zero": dips_below_zero}
+    df = pandas.DataFrame(data)
+
+    if not args.plotassembled:
+        #from cxid9114.prediction import prediction_utils
+        import pylab as plt
+        #refls_predict_bypanel = prediction_utils.refls_by_panelname(Rnew)
+        pause = args.pause
+        plt.figure(1)
+        ax = plt.gca()
+        refls_bypanel = df.groupby("panel")
+        for panel_id in df.panel.unique():
+            if args.pause == -1:
+                plt.figure(1)
+                ax = plt.gca()
+            panel_img = imgs[panel_id]
+            #panel_img = is_bg_pix[panel_id]
+            m = panel_img.mean()
+            s = panel_img.std()
+            vmax = m + 4 * s
+            vmin = m - s
+            ax.clear()
+            im = ax.imshow(panel_img, vmax=vmax, vmin=vmin)
+
+            df_p = refls_bypanel.get_group(panel_id)
+            for i_ref in range(len(df_p)):
+                #ref = redict_bypanel[panel_id][i_ref]
+                i1, i2, j1, j2 = df_p.iloc[i_ref]['shoebox_roi']
+                snr = df_p.iloc[i_ref]["snr"]
+                if snr >= args.minsnr:
+                    color = "Limegreen"
+                else:
+                    color = "Darkorange"
+                rect = plt.Rectangle(xy=(i1, j1), width=i2 - i1, height=j2 - j1, fc='none', ec=color)
+                plt.gca().add_patch(rect)
+                xx, yy, _ = df_p.iloc[i_ref]["xyzobs.px.value"]
+                plt.plot([xx-0.5], [yy-0.5], 'rx')
+                #mask = ref['shoebox'].mask.as_numpy_array()[0]
+                #int_mask[j1:j2, i1:i2] = np.logical_or(mask == 5, int_mask[j1:j2, i1:i2])
+                #bg_mask[j1:j2, i1:i2] = np.logical_or(mask == 19, bg_mask[j1:j2, i1:i2])
+            if pause == -1:
+                plt.show()
+            else:
+                plt.draw()
+                plt.pause(pause)
+    else:
+        assert args.minsnr is not None
+        assert args.mintilt is not None
+        all_xx = []
+        all_yy = []
+        for i_panel in range(len(imgs)):
+            node = El[0].detector[i_panel]
+            pix = node.get_pixel_size()[0]
+            fs = np.array(node.get_fast_axis())
+            ss = np.array(node.get_slow_axis())
+            o = np.array(node.get_origin()) / pix
+
+            Nfs, Nss = node.get_image_size()
+            Y, X = np.indices((Nss, Nfs))
+            xx = fs[0] * X + ss[0] * Y + o[0]
+            yy = fs[1] * X + ss[1] * Y + o[1]
+            all_xx.append(xx)
+            all_yy.append(yy)
+        all_xx = np.array(all_xx)
+        all_yy = np.array(all_yy)
+
+        binsX = np.arange(int(np.min(all_xx)), int(np.max(all_xx)), 1)
+        binsY = np.arange(int(np.min(all_yy)), int(np.max(all_yy)), 1)
+        out = np.histogram2d(all_xx.ravel(), all_yy.ravel(), bins=(binsX, binsY), weights=imgs.ravel())
+
+        r_color = 'Limegreen'
+        rej_color = 'Darkorange'
+        rej_patches = []
+        r_patches = []
+        snr = integrations / np.sqrt(variances)
+        snr = np.nan_to_num(snr)
+        for i_r in range(len(df)):
+
+            ref = refls[i_r]
+            panel = int( df.iloc[i_r]["panel"])
+            node = El[0].detector[panel]
+            pixsize = node.get_pixel_size()[0]
+            xpix, ypix, _ = df.iloc[i_r]["xyzobs.px.value"]
+            xpix = xpix - 0.5
+            ypix = ypix - 0.5
+            xlab, ylab, _ = np.array(node.get_pixel_lab_coord((xpix, ypix)))/pixsize
+
+            # FIXME: something weird with the display on CSPADs, to do with fast /slow scan vectors?
+            i1, i2, j1, j2 = df.iloc[i_r]['shoebox_roi']
+            width = i2-i1
+            height = j2-j1
+            if snr[i_r] >= args.minsnr and tilt_error[i_r] <= args.mintilt:
+                r_rect = plt.Rectangle(xy=(ylab - height/2., xlab - width/2.), width=width,
+                                       height=height, ec=r_color, fc='None')
+                r_patches.append(r_rect)
+
+            else:
+                rect = plt.Rectangle(xy=(ylab-height/2., xlab-width/2.), width=width,
+                                 height=height, ec=rej_color, fc='None')
+                rej_patches.append(rect)
+
+        plt.clf()
+        plt.imshow(out[0], extent=(out[2][0], out[2][-1], out[1][-1], out[1][0]), vmin=args.vmin, vmax=args.vmax)
+        coll = plt.mpl.collections.PatchCollection(rej_patches, match_original=True)
+        r_coll = plt.mpl.collections.PatchCollection(r_patches, match_original=True)
+        plt.gca().add_collection(coll)
+        plt.gca().add_collection(r_coll)
+        plt.suptitle("Green: SNR >= %.2f, Orange:SNR < %.2f" % (args.minsnr, args.minsnr))
+        plt.show()
+
+
     #    delta_q=0.07, photon_gain=GAIN, sigma_rdout=sigma_readout, zinger_zscore=outlier_Z,
     #    exper=El[0], predicted_refls=refls, sb_pad=5, filter_boundary_spots=args.filterboundaryspots,
     #    minsnr=args.minsnr, mintilt=args.mintilt, plot=True, vmin=args.vmin, vmax=args.vmax)
