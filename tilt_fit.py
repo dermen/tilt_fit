@@ -340,7 +340,7 @@ class TiltPlanes:
         #  -the variance matrix from the least squares determination of the coefficients
         #  -the integrated I (summed intensity of Bragg peak)
         #  -the variance of integrated I
-        return shoebox_roi, self.coefs, self.variance_matrix, Isum, varIsum, self.tilt_dips_below_zero
+        return shoebox_roi, self.coefs, self.variance_matrix, Isum, varIsum, self.tilt_dips_below_zero, self.fit_sel
 
     @staticmethod
     def prep_relfs_for_tiltalization(predicted_refls, exper):
@@ -675,6 +675,7 @@ if __name__ == "__main__":
     import pandas
     panels = []
     bboxes = []
+    all_fit_sel = []
     xyzobs =[]
     dips_below_zero = []
 
@@ -687,12 +688,13 @@ if __name__ == "__main__":
             ref["shoebox_roi"] = 0,1,0,1,0,1
             below_zero_flag = None
             continue
-        shoebox_roi, coefs, variance_matrix, Isum, varIsum, below_zero_flag = result
+        shoebox_roi, coefs, variance_matrix, Isum, varIsum, below_zero_flag, fit_sel = result
         dips_below_zero.append(below_zero_flag)
         bboxes.append(list(shoebox_roi))
         integrations.append(Isum)
         variances.append(varIsum)
         tilt_error.append(np.diag(variance_matrix).sum())
+        all_fit_sel.append(fit_sel)
 
         x1, x2, y1, y2 = shoebox_roi
         Y, X = np.indices((y2-y1, x2-x1)) #range(x1, x2), range(y1, y2))
