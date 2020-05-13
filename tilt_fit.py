@@ -328,7 +328,11 @@ class TiltPlanes:
 
 
         # fit of the tilt plane background
-        self.coefs, self.variance_matrix = self.fit_background_pixels_to_plane()
+        fit_results = self.fit_background_pixels_to_plane()
+        if fit_results is None:
+            print("Error in least squares treatment")
+            return None
+        self.coefs, self.variance_matrix = fit_results
 
         Isum, varIsum = self._integrate()
 
